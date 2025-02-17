@@ -185,6 +185,8 @@ def load_vla(
     with open(config_json, "r") as f:
         vla_cfg = json.load(f)["vla"]
         base_vlm = vla_cfg["base_vlm"]
+        if "image_sequence_len" in vla_cfg:
+            image_sequence_len = vla_cfg["image_sequence_len"]
 
     # if base vlm is a folder, load its config.json (only works for native format!)
     # this might happen if you start a run who's base vlm is from a folder instead of from hf
