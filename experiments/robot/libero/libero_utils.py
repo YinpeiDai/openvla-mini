@@ -48,26 +48,34 @@ def resize_image(img, resize_size):
     return img
 
 
-def get_libero_image(obs, resize_size, key="agentview_image"):
+def get_libero_image(obs, resize_size, key="agentview_image", flip_twice=False):
     """Extracts image from observations and preprocesses it."""
     assert isinstance(resize_size, int) or isinstance(resize_size, tuple)
     if isinstance(resize_size, int):
         resize_size = (resize_size, resize_size)
     img = obs[key]
-    img = np.flipud(img)
-    # img = img[::-1, ::-1]  # IMPORTANT: rotate 180 degrees to match train preprocessing
+    if flip_twice:
+        img = img[::-1, ::-1]  # IMPORTANT: rotate 180 degrees to match train preprocessing
+    else:
+        img = np.flipud(img)
     img = Image.fromarray(img)
     img = img.resize(resize_size, Image.Resampling.LANCZOS)  # resize to size seen at train time
     img = img.convert("RGB")
     return np.array(img)
 
 
-def save_rollout_video(rollout_images, idx, success, task_description, log_file=None):
+def save_rollout_video(rollout_images, idx, success, task_description, log_file=None, rollout_dir=None):
     """Saves an MP4 replay of an episode."""
-    rollout_dir = f"./rollouts/{DATE}"
-    os.makedirs(rollout_dir, exist_ok=True)
-    processed_task_description = task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")[:50]
-    mp4_path = f"{rollout_dir}/{DATE_TIME}--episode={idx}--success={success}--task={processed_task_description}.mp4"
+    if rollout_dir is None:
+        rollout_dir = f"./rollouts/{DATE}"        
+        os.makedirs(rollout_dir, exist_ok=True)
+        processed_task_description = task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")[:50]
+        mp4_path = f"{rollout_dir}/{DATE_TIME}--episode={idx}--success={success}--task={processed_task_description}.mp4"
+    else:
+        os.makedirs(rollout_dir, exist_ok=True)
+        processed_task_description = task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")
+        mp4_path = f"{rollout_dir}/ep{idx}-succ{success}-{processed_task_description}.mp4"
+    
     video_writer = imageio.get_writer(mp4_path, fps=30)
     for img in rollout_images:
         video_writer.append_data(img)
