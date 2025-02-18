@@ -172,6 +172,14 @@ def main(args):
                 )
                 agentview_images.append(obs["agentview_image"])
                 eye_in_hand_images.append(obs["robot0_eye_in_hand_image"])
+                
+                # save images
+                from PIL import Image
+                front_image = Image.fromarray(obs["agentview_image"])
+                front_image.save(f'agentview.png')
+                wrist_image = Image.fromarray(obs["robot0_eye_in_hand_image"])
+                wrist_image.save(f'wrist.png')
+                
 
                 # Execute demo action in environment
                 obs, reward, done, info = env.step(action.tolist())
