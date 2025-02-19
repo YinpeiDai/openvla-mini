@@ -1,32 +1,10 @@
-"""
-Regenerates a LIBERO dataset (HDF5 files) by replaying demonstrations in the environments.
-
-Notes:
-    - We save image observations at 256x256px resolution (instead of 128x128).
-    - We filter out transitions with "no-op" (zero) actions that do not change the robot's state.
-    - We filter out unsuccessful demonstrations.
-    - In the LIBERO HDF5 data -> RLDS data conversion (not shown here), we rotate the images by
-    180 degrees because we observe that the environments return images that are upside down
-    on our platform.
-
-Usage:
-    python experiments/robot/libero/regenerate_libero_dataset.py \
-        --libero_task_suite [ libero_spatial | libero_object | libero_goal | libero_10 ] \
-        --libero_raw_data_dir <PATH TO RAW HDF5 DATASET DIR> \
-        --libero_target_dir <PATH TO TARGET DIR>
-
-    Example (LIBERO-Spatial):
-        python experiments/robot/libero/regenerate_libero_dataset.py \
-            --libero_task_suite libero_spatial \
-            --libero_raw_data_dir ./LIBERO/libero/datasets/libero_spatial \
-            --libero_target_dir ./LIBERO/libero/datasets/libero_spatial_no_noops
-
-"""
-
 import argparse
+from copy import deepcopy
 import json
 import os
+import time
 
+import cv2
 import h5py
 import numpy as np
 import robosuite.utils.transform_utils as T
@@ -37,6 +15,10 @@ from experiments.robot.libero.libero_utils import (
     get_libero_dummy_action,
     get_libero_env,
 )
+
+
+from experiments.robot.libero.reticle_builder import ReticleBuilder, Pose, VideoRecorder
+from robosuite.utils.camera_utils import get_camera_extrinsic_matrix, get_camera_intrinsic_matrix, get_real_depth_map
 
 IMAGE_RESOLUTION = 256
 
@@ -67,16 +49,20 @@ def is_noop(action, prev_action=None, threshold=1e-4):
 
 
 def main(args):
+    reticle_builder = ReticleBuilder()
+    video_recoder = VideoRecorder(num_image=2, output_dir="./rollouts/reticles")
+    
+    
     print(f"Regenerating {args.libero_task_suite} dataset!")
 
-    # Create target directory
-    if os.path.isdir(args.libero_target_dir):
-        user_input = input(
-            f"Target directory already exists at path: {args.libero_target_dir}\n"
-            "Enter 'y' to overwrite the directory, or anything else to exit: "
-        )
-        if user_input != "y":
-            exit()
+    # # Create target directory
+    # if os.path.isdir(args.libero_target_dir):
+    #     user_input = input(
+    #         f"Target directory already exists at path: {args.libero_target_dir}\n"
+    #         "Enter 'y' to overwrite the directory, or anything else to exit: "
+    #     )
+    #     if user_input != "y":
+    #         exit()
     os.makedirs(args.libero_target_dir, exist_ok=True)
 
     # Prepare JSON file to record success/false and initial states per episode
@@ -99,11 +85,12 @@ def main(args):
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
         # Get task in suite
         task = task_suite.get_task(task_id)
-        env, task_description = get_libero_env(task, "llava", resolution=IMAGE_RESOLUTION)
+        env, task_description = get_libero_env(task, "llava", resolution=IMAGE_RESOLUTION, use_depth=True)
 
         # Get dataset for task
         orig_data_path = os.path.join(args.libero_raw_data_dir, f"{task.name}_demo.hdf5")
         assert os.path.exists(orig_data_path), f"Cannot find raw data file {orig_data_path}."
+        print(f"Regenerating demos for task '{task_description}' from: {orig_data_path}")
         orig_data_file = h5py.File(orig_data_path, "r")
         orig_data = orig_data_file["data"]
 
@@ -111,8 +98,13 @@ def main(args):
         new_data_path = os.path.join(args.libero_target_dir, f"{task.name}_demo.hdf5")
         new_data_file = h5py.File(new_data_path, "w")
         grp = new_data_file.create_group("data")
+        
 
         for i in range(len(orig_data.keys())):
+            if i >=5: break
+            if i < 10:
+                video_recoder.start(video_name=f"{args.libero_task_suite}-task_{task_id}-{task.name}-demo_{i}")
+            
             # Get demo data
             demo_data = orig_data[f"demo_{i}"]
             orig_actions = demo_data["actions"][()]
@@ -170,17 +162,87 @@ def main(args):
                         )
                     )
                 )
-                agentview_images.append(obs["agentview_image"])
-                eye_in_hand_images.append(obs["robot0_eye_in_hand_image"])
                 
-                # save images
-                from PIL import Image
-                front_image = Image.fromarray(obs["agentview_image"])
-                front_image.save(f'agentview.png')
-                wrist_image = Image.fromarray(obs["robot0_eye_in_hand_image"])
-                wrist_image.save(f'wrist.png')
+                # ------------------------------ # 
+                # Get reticle image
+                target_pose = Pose(
+                    position=deepcopy(obs["robot0_eef_pos"]), 
+                    orientation=deepcopy(obs["robot0_eef_quat"]), 
+                    gripper_open=deepcopy(obs["robot0_gripper_qpos"])
+                )
+                # print(obs["robot0_gripper_qpos"], target_pose.gripper_open)
                 
-
+                front_image = np.flipud(obs["agentview_image"]).astype(np.uint8)
+                front_depth = np.flipud(obs["agentview_depth"]).squeeze()
+                front_depth_real = get_real_depth_map(env.sim, front_depth)
+                front_depth = (front_depth_real / front_depth_real.max() * 255).astype(np.uint8)
+                front_depth = 255 - front_depth
+                
+                front_camera_extrinsic = np.linalg.inv(get_camera_extrinsic_matrix(env.sim, "agentview"))
+                front_camera_intrinsic = get_camera_intrinsic_matrix(env.sim, "agentview", IMAGE_RESOLUTION, IMAGE_RESOLUTION)
+                
+                reticle_builder.render_on_fix_camera(
+                    camera_rgb=front_image,
+                    camera_depth=front_depth_real,
+                    camera_extrinsics=front_camera_extrinsic,
+                    camera_intrinsics=front_camera_intrinsic,
+                    target_pose=target_pose,
+                    gripper_pose=target_pose,
+                    tolerance=10
+                )
+                
+                
+                wrist_image = np.flipud(obs["robot0_eye_in_hand_image"]).astype(np.uint8)
+                wrist_depth = np.flipud(obs["robot0_eye_in_hand_depth"]).squeeze()
+                
+                wrist_depth_real = get_real_depth_map(env.sim, wrist_depth)
+                wrist_depth = (wrist_depth_real / wrist_depth_real.max() * 255).astype(np.uint8)
+                wrist_depth = 255 - wrist_depth
+                
+                wrist_camera_extrinsic = np.linalg.inv(get_camera_extrinsic_matrix(env.sim, "robot0_eye_in_hand"))
+                wrist_camera_intrinsic = get_camera_intrinsic_matrix(env.sim, "robot0_eye_in_hand", IMAGE_RESOLUTION, IMAGE_RESOLUTION)
+                
+                
+                reticle_builder.render_on_wst_camera(
+                    wrist_camera_rgb=wrist_image,
+                    wrist_camera_depth=wrist_depth_real,
+                    wrist_camera_extrinsics=wrist_camera_extrinsic,
+                    wrist_camera_intrinsics=wrist_camera_intrinsic,
+                    target_pose=target_pose,
+                    gripper_pose=target_pose,
+                )
+                
+                # # save images
+                # from PIL import Image
+                # front_image = Image.fromarray(front_image)
+                # front_image.save(f'agentview.png')
+                
+                # # draw depth image.
+                # # make depth image to 3 channel image
+                # front_depth = (front_depth / front_depth.max() * 255).astype(np.uint8)
+                # front_depth = 255 - front_depth
+                # front_depth = Image.fromarray(np.concatenate([front_depth[:, :, None]]*3, axis=2))
+                # front_depth.save(f'agentview_depth.png')
+                
+                
+                # wrist_image = Image.fromarray(wrist_image)
+                # wrist_image.save(f'wrist.png')
+                
+                # # draw depth image.
+                # wrist_depth = (wrist_depth / wrist_depth.max() * 255).astype(np.uint8)
+                # wrist_depth = 255 - wrist_depth
+                # wrist_depth = Image.fromarray(np.concatenate([wrist_depth[:, :, None]]*3, axis=2))
+                # wrist_depth.save(f'wrist_depth.png')
+                
+                if i<10:
+                    video_recoder.add_frame([front_image, wrist_image])
+                
+                # ------------------------------ # 
+                
+                
+                agentview_images.append(np.flipud(front_image))
+                eye_in_hand_images.append(np.flipud(wrist_image))
+                
                 # Execute demo action in environment
                 obs, reward, done, info = env.step(action.tolist())
 
@@ -210,6 +272,9 @@ def main(args):
                 num_success += 1
 
             num_replays += 1
+            
+            if i<10:
+                video_recoder.close()
 
             # Record success/false and initial environment state in metainfo dict
             task_key = task_description.replace(" ", "_")
@@ -240,6 +305,7 @@ def main(args):
         new_data_file.close()
         print(f"Saved regenerated demos for task '{task_description}' at: {new_data_path}")
 
+    env.close()
     print(f"Dataset regeneration complete! Saved new dataset at: {args.libero_target_dir}")
     print(f"Saved metainfo JSON at: {metainfo_json_out_path}")
 
